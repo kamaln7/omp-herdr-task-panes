@@ -1,0 +1,13 @@
+# Demo-only overlay: no MCP servers, skills, rules, context files, or ambient extensions.
+# The extension under demo is loaded explicitly with -e (see demo.tape).
+disabledProviders:
+  [native, omp-plugins, claude, agent-plugins, codex, agents, claude-plugins, gemini, opencode,
+   cursor, windsurf, cline, github, vscode, agents-md, claude-md, mcp-json, ssh-json]
+symbolPreset: unicode
+tui:
+  tight: true
+statusLine:
+  preset: compact
+startup:
+  checkUpdate: false
+  quiet: true
