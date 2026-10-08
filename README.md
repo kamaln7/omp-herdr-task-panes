@@ -13,3 +13,5 @@ git clone https://github.com/kamaln7/omp-herdr-task-panes ~/.omp/agent/extension
 ```
 
 Run omp inside a herdr pane. Requires `bun`. Disable with `OMP_HERDR_TASK_PANES=0`.
+
+Preview the pane header/footer states without a session: `bun view.ts --mock <waiting|thinking|running|action|done>`.

@@ -14,9 +14,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
-const [file = process.env.HTP_FILE, label = process.env.HTP_LABEL ?? "subagent"] = process.argv.slice(2);
-if (!file) {
-	console.error("usage: view.ts <session.jsonl> [label]  (or HTP_FILE / HTP_LABEL env)");
+// `--mock <state>` paints the chrome with canned metadata and no transcript, for previewing.
+const MOCKS = ["waiting", "thinking", "running", "action", "done"] as const;
+const mock = process.argv[2] === "--mock" ? (process.argv[3] ?? "") : undefined;
+if (mock !== undefined && !(MOCKS as readonly string[]).includes(mock)) {
+	console.error(`usage: view.ts --mock <${MOCKS.join("|")}>`);
+	process.exit(2);
+}
+const [file = process.env.HTP_FILE, label = process.env.HTP_LABEL ?? "subagent"] =
+	mock === undefined ? process.argv.slice(2) : ["", `mock ${mock}`];
+if (!file && mock === undefined) {
+	console.error("usage: view.ts <session.jsonl> [label]  (or HTP_FILE / HTP_LABEL env)\n       view.ts --mock <state>");
 	process.exit(2);
 }
 
@@ -43,6 +51,12 @@ let header: string[] = []; // `title` + `session` lines; required by `omp render
 let blocks: Block[] = []; // rendered history, oldest first
 let pending: Entry[] = []; // read, not yet in a block
 let openCalls: string[] = []; // tool names awaiting results
+// Live run metadata, derived from session entries.
+let model = ""; // provider prefix stripped
+let effort = "";
+let startedAt = 0; // session header timestamp (ms)
+let endedAt = 0; // set when the last message is a final assistant answer
+let todo: { done: number; total: number } | undefined;
 
 let fd: number | undefined;
 let ino = 0;
@@ -58,6 +72,9 @@ function resetFile(): void {
 	blocks = [];
 	pending = [];
 	openCalls = [];
+	model = effort = "";
+	startedAt = endedAt = 0;
+	todo = undefined;
 	offset = 0;
 	partial = "";
 	decoder = new StringDecoder("utf8");
@@ -98,10 +115,48 @@ function readNew(): boolean {
 			continue; // not a complete entry
 		}
 		if (!isObj(json)) continue;
+		track(json);
 		if (json.type === "title" || json.type === "session") header.push(raw);
 		else pending.push({ raw, json });
 	}
 	return true;
+}
+
+function track(json: Obj): void {
+	const ts = typeof json.timestamp === "string" ? Date.parse(json.timestamp) : NaN;
+	if (json.type === "session" && !Number.isNaN(ts)) startedAt = ts;
+	else if (json.type === "model_change" && typeof json.model === "string") model = json.model.replace(/^[^/]*\//, "");
+	else if (json.type === "thinking_level_change" && typeof json.thinkingLevel === "string") effort = json.thinkingLevel;
+	if (json.type !== "message" || !isObj(json.message)) return;
+	const m = json.message;
+	if (m.role === "toolResult" && m.toolName === "yield") return; // keep the yield call's end time
+	// A final answer, or a call to `yield` (how subagents hand back results), ends the run.
+	const calls = Array.isArray(m.content) ? m.content.filter(b => isObj(b) && b.type === "toolCall") : [];
+	const final = m.role === "assistant" && calls.every(b => isObj(b) && b.name === "yield");
+	endedAt = final && !Number.isNaN(ts) ? ts : 0;
+	// Progress comes from the subagent's own todo list, when it keeps one.
+	if (m.role === "toolResult" && m.toolName === "todo" && isObj(m.details) && Array.isArray(m.details.phases)) {
+		const tasks = m.details.phases.flatMap(p => (isObj(p) && Array.isArray(p.tasks) ? p.tasks : []));
+		const total = tasks.filter(t => isObj(t) && t.status !== "abandoned").length;
+		todo = total ? { done: tasks.filter(t => isObj(t) && t.status === "completed").length, total } : undefined;
+	}
+}
+
+// 45s, 5m20s, 1h05m.
+function duration(ms: number): string {
+	const s = Math.max(0, Math.floor(ms / 1000));
+	if (s < 60) return `${s}s`;
+	if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+	return `${Math.floor(s / 3600)}h${String(Math.floor(s / 60) % 60).padStart(2, "0")}m`;
+}
+
+// Best effort from completed entries only: the JSONL carries no streaming state.
+function statusText(): string {
+	if (!header.length) return "\x1b[2mwaiting for session…\x1b[0m";
+	if (endedAt) return "\x1b[32m✓ done\x1b[0m";
+	if (openCalls.includes("ask")) return "\x1b[1;33m⚠ action required\x1b[0m";
+	if (openCalls.length) return `\x1b[36m⏳ running ${openCalls.join(", ")}\x1b[0m`;
+	return "\x1b[35m… thinking\x1b[0m";
 }
 
 // Move the longest pending prefix with no unanswered tool calls into a new (unrendered) block.
@@ -148,7 +203,7 @@ async function renderEntries(entries: Entry[], width: number): Promise<string[]>
 async function fillViewport(): Promise<void> {
 	if (!header.length) return;
 	const width = cols();
-	const need = rows() - 2;
+	const need = rows() - 1;
 	let have = 0;
 	let i = blocks.length - 1;
 	while (i >= 0 && have < need) {
@@ -178,20 +233,25 @@ function paint(): void {
 	const width = cols();
 	const height = rows();
 	const body: string[] = [];
-	for (let i = blocks.length - 1; i >= 0 && body.length < height - 2; i--) {
+	for (let i = blocks.length - 1; i >= 0 && body.length < height - 1; i--) {
 		const b = blocks[i];
 		if (b.width !== width || !b.lines) break;
 		body.unshift(...b.lines);
 	}
-	const shown = body.slice(-(height - 2));
-	const title = `\x1b[1m● ${label}\x1b[0m`;
-	const status = openCalls.length
-		? `\x1b[2m⏳ ${openCalls.join(", ")} running…\x1b[0m`
-		: header.length
-			? ""
-			: "\x1b[2mwaiting for session…\x1b[0m";
-	let frame = `\x1b[1;1H${title}\x1b[K`;
-	for (let r = 0; r < height - 2; r++) frame += `\x1b[${r + 2};1H${shown[r] ?? ""}\x1b[0m\x1b[K`;
+	const shown = body.slice(-(height - 1));
+	// herdr already draws the pane title in the border; model/effort go there as a prefix.
+	const meta = [model, effort].filter(Boolean).join(" · ");
+	const title = meta ? `[${meta}] ${label}` : label;
+	if (title !== lastTitle) {
+		out.write(`\x1b]2;${title}\x07`);
+		lastTitle = title;
+	}
+	const parts = [statusText()];
+	if (startedAt) parts.push(`\x1b[2m${duration((endedAt || Date.now()) - startedAt)}\x1b[0m`);
+	if (todo) parts.push(`\x1b[2m${todo.done}/${todo.total} tasks\x1b[0m`);
+	const status = parts.join("  ");
+	let frame = "";
+	for (let r = 0; r < height - 1; r++) frame += `\x1b[${r + 1};1H${shown[r] ?? ""}\x1b[0m\x1b[K`;
 	frame += `\x1b[${height};1H${status}\x1b[K`;
 	if (frame === lastFrame) return;
 	out.write(frame);
@@ -210,9 +270,11 @@ async function update(): Promise<void> {
 	try {
 		do {
 			again = false;
-			readNew();
-			closeBlock();
-			await fillViewport();
+			if (mock === undefined) {
+				readNew();
+				closeBlock();
+				await fillViewport();
+			}
 			paint();
 		} while (again);
 	} finally {
@@ -220,7 +282,17 @@ async function update(): Promise<void> {
 	}
 }
 
-out.write(`\x1b]2;${label}\x07`);
+if (mock && mock !== "waiting") {
+	header = ["mock"];
+	model = "claude-opus-5-5";
+	effort = "high";
+	startedAt = Date.now() - 320_000;
+	todo = { done: 3, total: 7 };
+	if (mock === "running") openCalls = ["read", "grep"];
+	if (mock === "action") openCalls = ["ask"];
+	if (mock === "done") endedAt = Date.now();
+}
+let lastTitle = "";
 let resizeTimer: Timer | undefined;
 out.on("resize", () => {
 	clearTimeout(resizeTimer);

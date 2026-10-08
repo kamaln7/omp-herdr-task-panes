@@ -209,7 +209,6 @@ export default function (pi: ExtensionAPI) {
 			if (slots.get(file) !== slot) return; // ended before its pane was opened
 			slot.paneId = await openPane(ctx.cwd, { HTP_VIEW: VIEWER, HTP_FILE: file, HTP_LABEL: label });
 			await rebalance();
-			await herdr("pane", "rename", slot.paneId, label);
 			await herdr("pane", "run", slot.paneId, 'exec bun "$HTP_VIEW"');
 		});
 	});
